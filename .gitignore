@@ -21,3 +21,4 @@ catalyst_env/
 # Temporary files
 *.log
 .DS_Store
+instance/private_documents/
