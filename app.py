@@ -9,7 +9,10 @@ extensions, configures authentication, and registers routes.
 import os
 from pathlib import Path
 
-import zcatalyst_sdk
+try:
+    import zcatalyst_sdk
+except ImportError:  # Zoho Catalyst SDK is only needed on Catalyst AppSail
+    zcatalyst_sdk = None
 
 from flask import Flask, redirect, url_for, request, g
 
@@ -46,7 +49,7 @@ def create_app():
         Local development continues without Catalyst initialization.
         """
 
-        if os.getenv("X_ZOHO_CATALYST_LISTEN_PORT"):
+        if zcatalyst_sdk and os.getenv("X_ZOHO_CATALYST_LISTEN_PORT"):
             g.catalyst_app = zcatalyst_sdk.initialize(req=request)
 
     # -----------------------------------------------------
