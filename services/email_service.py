@@ -10,14 +10,27 @@ Handles:
 - Candidate rejection emails.
 - PDF offer letter generation and delivery.
 - Onboarding emails.
+- Document verification notifications.
+- Login OTP emails.
+
+Email providers:
+- Brevo HTTPS API (recommended for Render).
+- SMTP (optional for environments that allow SMTP).
 
 Company name used in candidate-facing documents: Mitraz.
 """
 
+import base64
+import json
 import logging
+import os
 import smtplib
-from io import BytesIO
+import urllib.error
+import urllib.request
+
 from email.message import EmailMessage
+from email.utils import formataddr, getaddresses, parseaddr
+from io import BytesIO
 from xml.sax.saxutils import escape
 
 from flask import current_app
@@ -40,13 +53,50 @@ logger = logging.getLogger(__name__)
 
 COMPANY_NAME = "Mitraz"
 
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
+EMAIL_TIMEOUT = 20
+
 
 # =========================================================
 # 1. GENERAL HELPERS
 # =========================================================
 
+def get_setting(name, default=None):
+    """
+    Read a setting from Flask configuration first,
+    then fall back to environment variables.
+    """
+
+    value = current_app.config.get(name)
+
+    if value is None or value == "":
+        value = os.getenv(name, default)
+
+    return value
+
+
+def get_bool_setting(name, default=False):
+    """Read a boolean setting safely."""
+
+    value = get_setting(name, default)
+
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
+        return default
+
+    return str(value).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def safe_text(value):
     """Convert values to safe text for ReportLab Paragraphs."""
+
     return escape(str(value or ""))
 
 
@@ -58,17 +108,79 @@ def validate_recipient(recipient):
 
     recipient = recipient.strip()
 
-    if not recipient or "@" not in recipient:
-        raise ValueError("A valid candidate email address is required.")
+    name, address = parseaddr(recipient)
 
-    return recipient
+    if (
+        not address
+        or "@" not in address
+        or address.startswith("@")
+        or address.endswith("@")
+        or any(character.isspace() for character in address)
+    ):
+        raise ValueError(
+            "A valid candidate email address is required."
+        )
+
+    return address
+
+
+def get_email_addresses(header_value):
+    """Extract valid email addresses from an email header."""
+
+    if not header_value:
+        return []
+
+    addresses = []
+
+    for name, address in getaddresses([str(header_value)]):
+        address = address.strip()
+
+        if address and "@" in address:
+            addresses.append({
+                "email": address,
+                **({"name": name} if name else {}),
+            })
+
+    return addresses
+
+
+def get_sender_details():
+    """Get the configured sender name and email address."""
+
+    sender = (
+        get_setting("MAIL_DEFAULT_SENDER")
+        or get_setting("MAIL_USERNAME")
+    )
+
+    if not sender:
+        raise ValueError(
+            "Email sender is not configured. "
+            "Set MAIL_DEFAULT_SENDER."
+        )
+
+    sender_name, sender_email = parseaddr(str(sender))
+
+    if (
+        not sender_email
+        or "@" not in sender_email
+        or sender_email.startswith("@")
+        or sender_email.endswith("@")
+    ):
+        raise ValueError(
+            "MAIL_DEFAULT_SENDER must contain a valid email address."
+        )
+
+    return {
+        "name": sender_name or COMPANY_NAME,
+        "email": sender_email,
+    }
 
 
 def send_email(recipient, subject, body):
     """
     Send a plain-text email.
 
-    This function is retained for compatibility with existing routes.
+    Retained for compatibility with existing routes.
     """
 
     recipient = validate_recipient(recipient)
@@ -80,9 +192,9 @@ def send_email(recipient, subject, body):
         raise ValueError("Email body is required.")
 
     message = EmailMessage()
-    message["Subject"] = subject
+    message["Subject"] = str(subject)
     message["To"] = recipient
-    message.set_content(body)
+    message.set_content(str(body))
 
     send_message(message)
 
@@ -90,38 +202,293 @@ def send_email(recipient, subject, body):
 
 
 # =========================================================
-# 2. SMTP EMAIL SENDER
+# 2. EMAIL CONTENT HELPERS
 # =========================================================
 
-def send_message(message):
-    """Send an email using configured SMTP settings."""
+def get_message_content(message, content_type):
+    """
+    Extract plain-text or HTML content from an EmailMessage.
 
-    mail_server = current_app.config.get("MAIL_SERVER")
-    mail_port = current_app.config.get("MAIL_PORT", 587)
-    mail_username = current_app.config.get("MAIL_USERNAME")
-    mail_password = current_app.config.get("MAIL_PASSWORD")
+    Returns None when the requested content type is unavailable.
+    """
+
+    try:
+        part = message.get_body(
+            preferencelist=(content_type,)
+        )
+
+        if part is None:
+            if message.get_content_type() == content_type:
+                part = message
+            else:
+                return None
+
+        content = part.get_content()
+
+        if isinstance(content, bytes):
+            return content.decode("utf-8", errors="replace")
+
+        return str(content)
+
+    except (AttributeError, LookupError, TypeError, ValueError):
+        logger.exception(
+            "Could not extract %s email content.",
+            content_type,
+        )
+        return None
+
+
+def get_brevo_attachments(message):
+    """Convert email attachments into Brevo API attachment objects."""
+
+    attachments = []
+
+    for part in message.iter_attachments():
+        filename = part.get_filename()
+
+        if not filename:
+            filename = "attachment"
+
+        content = part.get_payload(decode=True)
+
+        if content is None:
+            content = part.get_content()
+
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+
+        if not isinstance(content, bytes):
+            raise ValueError(
+                "Unsupported email attachment content."
+            )
+
+        attachments.append({
+            "name": filename,
+            "content": base64.b64encode(content).decode("ascii"),
+        })
+
+    return attachments
+
+
+# =========================================================
+# 3. BREVO EMAIL SENDER
+# =========================================================
+
+def send_brevo_message(message):
+    """
+    Send an EmailMessage using the Brevo HTTPS API.
+
+    Supports:
+    - Plain-text email content.
+    - HTML email content.
+    - Multiple recipients.
+    - CC and BCC.
+    - File attachments, including PDF offer letters.
+
+    The Brevo API key is read from the environment and is
+    never included in logs.
+    """
+
+    api_key = get_setting("BREVO_API_KEY")
+
+    if not api_key:
+        raise ValueError(
+            "BREVO_API_KEY is missing. "
+            "Configure it in the deployment environment."
+        )
+
+    sender = get_sender_details()
+
+    recipients = get_email_addresses(message.get("To"))
+
+    if not recipients:
+        raise ValueError(
+            "At least one valid email recipient is required."
+        )
+
+    subject = str(message.get("Subject", "")).strip()
+
+    if not subject:
+        raise ValueError("Email subject is required.")
+
+    payload = {
+        "sender": sender,
+        "to": recipients,
+        "subject": subject,
+    }
+
+    cc_recipients = get_email_addresses(message.get("Cc"))
+    bcc_recipients = get_email_addresses(message.get("Bcc"))
+
+    if cc_recipients:
+        payload["cc"] = cc_recipients
+
+    if bcc_recipients:
+        payload["bcc"] = bcc_recipients
+
+    plain_content = get_message_content(
+        message,
+        "text/plain",
+    )
+
+    html_content = get_message_content(
+        message,
+        "text/html",
+    )
+
+    if plain_content:
+        payload["textContent"] = plain_content
+
+    if html_content:
+        payload["htmlContent"] = html_content
+
+    if not plain_content and not html_content:
+        raise ValueError(
+            "Email message does not contain valid text or HTML content."
+        )
+
+    attachments = get_brevo_attachments(message)
+
+    if attachments:
+        payload["attachment"] = attachments
+
+    request_data = json.dumps(payload).encode("utf-8")
+
+    request = urllib.request.Request(
+        BREVO_API_URL,
+        data=request_data,
+        headers={
+            "accept": "application/json",
+            "api-key": api_key,
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=EMAIL_TIMEOUT,
+        ) as response:
+
+            status_code = response.getcode()
+            response_body = response.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+
+            if status_code not in (200, 201, 202):
+                raise RuntimeError(
+                    "Brevo returned an unexpected HTTP status: "
+                    "{}".format(status_code)
+                )
+
+            try:
+                response_data = json.loads(response_body)
+            except (json.JSONDecodeError, TypeError):
+                response_data = {}
+
+            logger.info(
+                "Email successfully submitted through Brevo. "
+                "HTTP status: %s",
+                status_code,
+            )
+
+            return response_data
+
+    except urllib.error.HTTPError as error:
+        # Do not log request headers or the API key.
+        try:
+            error_body = error.read().decode(
+                "utf-8",
+                errors="replace",
+            )
+        except Exception:
+            error_body = "No error response body available."
+
+        logger.error(
+            "Brevo email API request failed. HTTP status: %s. "
+            "Response: %s",
+            error.code,
+            error_body[:1000],
+        )
+
+        raise RuntimeError(
+            "Brevo email delivery failed. "
+            "HTTP status: {}.".format(error.code)
+        ) from error
+
+    except urllib.error.URLError as error:
+        logger.error(
+            "Brevo connection failed: %s",
+            getattr(error, "reason", "Unknown connection error"),
+        )
+
+        raise RuntimeError(
+            "Could not connect to the Brevo email service."
+        ) from error
+
+    except (TimeoutError, OSError):
+        logger.exception(
+            "Brevo email request timed out or encountered a network error."
+        )
+        raise
+
+    except Exception:
+        logger.exception(
+            "Unexpected error while sending email through Brevo."
+        )
+        raise
+
+
+# =========================================================
+# 4. SMTP EMAIL SENDER
+# =========================================================
+
+def send_smtp_message(message):
+    """
+    Send an email using configured SMTP settings.
+
+    This option is retained for environments that permit
+    outbound SMTP connections.
+
+    Render Free commonly blocks outbound SMTP ports, so
+    Brevo is recommended for the deployed application.
+    """
+
+    mail_server = get_setting("MAIL_SERVER")
+    mail_port = get_setting("MAIL_PORT", 587)
+    mail_username = get_setting("MAIL_USERNAME")
+    mail_password = get_setting("MAIL_PASSWORD")
 
     sender = (
-        current_app.config.get("MAIL_DEFAULT_SENDER")
+        get_setting("MAIL_DEFAULT_SENDER")
         or mail_username
     )
 
     recipient = message.get("To")
 
-    if not all([mail_server, mail_port, sender, recipient]):
+    if not all([
+        mail_server,
+        mail_port,
+        sender,
+        recipient,
+    ]):
         raise ValueError(
             "Email configuration is incomplete. "
-            "Check MAIL_SERVER, MAIL_PORT, MAIL_DEFAULT_SENDER "
-            "and recipient."
+            "Check MAIL_SERVER, MAIL_PORT, "
+            "MAIL_DEFAULT_SENDER and recipient."
         )
 
     try:
         mail_port = int(mail_port)
     except (TypeError, ValueError):
-        raise ValueError("MAIL_PORT must be a valid integer.")
+        raise ValueError(
+            "MAIL_PORT must be a valid integer."
+        )
 
-    use_ssl = current_app.config.get("MAIL_USE_SSL", False)
-    use_tls = current_app.config.get("MAIL_USE_TLS", True)
+    use_ssl = get_bool_setting("MAIL_USE_SSL", False)
+    use_tls = get_bool_setting("MAIL_USE_TLS", True)
 
     if use_ssl and use_tls:
         raise ValueError(
@@ -137,13 +504,14 @@ def send_message(message):
             smtp = smtplib.SMTP_SSL(
                 mail_server,
                 mail_port,
-                timeout=30,
+                timeout=EMAIL_TIMEOUT,
             )
+
         else:
             smtp = smtplib.SMTP(
                 mail_server,
                 mail_port,
-                timeout=30,
+                timeout=EMAIL_TIMEOUT,
             )
 
             smtp.ehlo()
@@ -151,10 +519,12 @@ def send_message(message):
             if use_tls:
                 smtp.starttls()
                 smtp.ehlo()
-        
 
         if mail_username and mail_password:
-            smtp.login(mail_username, mail_password)
+            smtp.login(
+                mail_username,
+                mail_password,
+            )
 
         refused = smtp.send_message(message)
 
@@ -162,14 +532,12 @@ def send_message(message):
             raise smtplib.SMTPRecipientsRefused(refused)
 
         logger.info(
-            "Email successfully submitted to SMTP server for %s",
-            recipient,
+            "Email successfully submitted to SMTP server."
         )
 
     except (smtplib.SMTPException, OSError):
         logger.exception(
-            "SMTP email sending failed for recipient %s",
-            recipient,
+            "SMTP email sending failed."
         )
         raise
 
@@ -177,6 +545,7 @@ def send_message(message):
         if smtp is not None:
             try:
                 smtp.quit()
+
             except (smtplib.SMTPException, OSError):
                 try:
                     smtp.close()
@@ -185,7 +554,39 @@ def send_message(message):
 
 
 # =========================================================
-# 3. SHORTLIST EMAIL
+# 5. EMAIL PROVIDER DISPATCHER
+# =========================================================
+
+def send_message(message):
+    """
+    Send an email using the configured provider.
+
+    EMAIL_PROVIDER=brevo  -> Brevo HTTPS API
+    EMAIL_PROVIDER=smtp   -> SMTP
+
+    Brevo failures are raised instead of silently falling back
+    to SMTP. This avoids long timeouts on Render, where SMTP
+    connections may be blocked.
+    """
+
+    provider = str(
+        get_setting("EMAIL_PROVIDER", "brevo")
+    ).strip().lower()
+
+    if provider == "brevo":
+        return send_brevo_message(message)
+
+    if provider == "smtp":
+        return send_smtp_message(message)
+
+    raise ValueError(
+        "Unsupported EMAIL_PROVIDER '{}'. "
+        "Use 'brevo' or 'smtp'.".format(provider)
+    )
+
+
+# =========================================================
+# 6. SHORTLIST EMAIL
 # =========================================================
 
 def send_shortlist_email(
@@ -193,9 +594,7 @@ def send_shortlist_email(
     recipient,
     job_title,
 ):
-    """
-    Notify a candidate that they have been shortlisted.
-    """
+    """Notify a candidate that they have been shortlisted."""
 
     recipient = validate_recipient(recipient)
 
@@ -204,8 +603,10 @@ def send_shortlist_email(
             "Candidate name and job title are required."
         )
 
-    subject = "Congratulations! You Have Been Shortlisted - {}".format(
-        job_title
+    subject = (
+        "Congratulations! You Have Been Shortlisted - {}".format(
+            job_title
+        )
     )
 
     body = f"""
@@ -236,7 +637,7 @@ Recruitment Team
 
 
 # =========================================================
-# 4. INTERVIEW SCHEDULE EMAIL
+# 7. INTERVIEW SCHEDULE EMAIL
 # =========================================================
 
 def send_interview_schedule_email(
@@ -250,9 +651,7 @@ def send_interview_schedule_email(
     interview_location=None,
     additional_instructions="",
 ):
-    """
-    Send interview schedule details to a candidate.
-    """
+    """Send interview schedule details to a candidate."""
 
     recipient = validate_recipient(recipient)
 
@@ -330,7 +729,7 @@ Recruitment Team
 
 
 # =========================================================
-# 5. SELECTION EMAIL WITH DOCUMENT UPLOAD LINK
+# 8. SELECTION EMAIL WITH DOCUMENT UPLOAD LINK
 # =========================================================
 
 def send_selection_email(
@@ -368,8 +767,10 @@ def send_selection_email(
             )
         )
 
-    subject = "Congratulations! You Have Been Selected - {}".format(
-        job_title
+    subject = (
+        "Congratulations! You Have Been Selected - {}".format(
+            job_title
+        )
     )
 
     body = f"""
@@ -416,7 +817,7 @@ Recruitment Team
 
 
 # =========================================================
-# 6. REJECTION EMAIL
+# 9. REJECTION EMAIL
 # =========================================================
 
 def send_rejection_email(
@@ -425,9 +826,7 @@ def send_rejection_email(
     job_title,
     additional_message="",
 ):
-    """
-    Send a professional candidate rejection email.
-    """
+    """Send a professional candidate rejection email."""
 
     recipient = validate_recipient(recipient)
 
@@ -473,7 +872,7 @@ Recruitment Team
 
 
 # =========================================================
-# 7. ONBOARDING EMAIL
+# 10. ONBOARDING EMAIL
 # =========================================================
 
 def send_onboarding_email(
@@ -485,9 +884,7 @@ def send_onboarding_email(
     reporting_location=None,
     additional_instructions="",
 ):
-    """
-    Send onboarding instructions after the offer letter is sent.
-    """
+    """Send onboarding instructions after the offer letter is sent."""
 
     recipient = validate_recipient(recipient)
 
@@ -556,7 +953,7 @@ HR / Recruitment Team
 
 
 # =========================================================
-# 8. OFFER LETTER PDF GENERATION
+# 11. OFFER LETTER PDF GENERATION
 # =========================================================
 
 def create_offer_pdf(
@@ -670,7 +1067,9 @@ def create_offer_pdf(
 
     safe_message = safe_text(message).replace("\n", "<br/>")
 
-    story.append(Paragraph(safe_message, body_style))
+    story.append(
+        Paragraph(safe_message, body_style)
+    )
 
     story.extend([
         Spacer(1, 20),
@@ -697,7 +1096,7 @@ def create_offer_pdf(
 
 
 # =========================================================
-# 9. OFFER LETTER EMAIL
+# 12. OFFER LETTER EMAIL
 # =========================================================
 
 def send_offer_email(
@@ -768,8 +1167,9 @@ Recruitment Team
 
     return True
 
+
 # =========================================================
-# 10. DOCUMENT VERIFICATION ADMIN EMAIL
+# 13. DOCUMENT VERIFICATION ADMIN EMAIL
 # =========================================================
 
 def send_document_verification_admin_email(
@@ -781,9 +1181,7 @@ def send_document_verification_admin_email(
     remarks="",
     **kwargs,
 ):
-    """
-    Notify the administrator about a candidate document verification decision.
-    """
+    """Notify the administrator about a document verification decision."""
 
     candidate_name = (
         candidate_name
@@ -797,7 +1195,11 @@ def send_document_verification_admin_email(
         or kwargs.get("recipient_email")
     )
 
-    job_title = job_title or kwargs.get("vacancy_title") or "Not specified"
+    job_title = (
+        job_title
+        or kwargs.get("vacancy_title")
+        or "Not specified"
+    )
 
     document_name = (
         document_name
@@ -806,14 +1208,24 @@ def send_document_verification_admin_email(
         or "Not specified"
     )
 
-    decision = decision or kwargs.get("verification_status") or "Not specified"
+    decision = (
+        decision
+        or kwargs.get("verification_status")
+        or "Not specified"
+    )
 
-    remarks = remarks or kwargs.get("verification_notes") or ""
+    remarks = (
+        remarks
+        or kwargs.get("verification_notes")
+        or ""
+    )
 
     recipient = validate_recipient(recipient)
 
-    subject = "Candidate Document Verification Update - {}".format(
-        candidate_name
+    subject = (
+        "Candidate Document Verification Update - {}".format(
+            candidate_name
+        )
     )
 
     body = f"""
@@ -846,8 +1258,9 @@ HireWise AI
 
     return True
 
+
 # =========================================================
-# 11. LOGIN OTP EMAIL
+# 14. LOGIN OTP EMAIL
 # =========================================================
 
 def send_login_otp_email(recipient, otp):
@@ -855,8 +1268,12 @@ def send_login_otp_email(recipient, otp):
 
     recipient = validate_recipient(recipient)
 
-    if not otp or len(str(otp)) != 6 or not str(otp).isdigit():
-        raise ValueError("A valid six-digit OTP is required.")
+    otp = str(otp).strip() if otp is not None else ""
+
+    if len(otp) != 6 or not otp.isdigit():
+        raise ValueError(
+            "A valid six-digit OTP is required."
+        )
 
     subject = "HireWise AI - Login Verification OTP"
 
@@ -867,7 +1284,7 @@ Your HireWise AI login verification code is:
 
 {otp}
 
-This OTP is valid for only 60 seconds.
+This OTP is valid for only 120 seconds (2 minutes).
 
 Do not share this code with anyone.
 
@@ -884,6 +1301,3 @@ HireWise AI Security Team
     )
 
     return True
-
-
-
