@@ -70,4 +70,3 @@ urllib3==2.8.0
 websocket-client==1.9.2
 Werkzeug==3.1.3
 WTForms==3.2.2
-zcatalyst_sdk==1.5.0
