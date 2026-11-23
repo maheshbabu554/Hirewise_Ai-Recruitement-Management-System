@@ -31,7 +31,12 @@ from services.ai_service import (
 )
 
 from services.evidence_service import analyze_requirement_evidence
-from services.resume_parser import get_full_resume_text
+
+from services.resume_parser import (
+    get_full_resume_text,
+    get_full_resume_text_from_bytes,
+)
+
 from routes.recruiter import recruiter_required
 
 
@@ -75,32 +80,47 @@ def get_owned_candidate(candidate_id):
 # =========================================================
 
 def get_candidate_resume_text(candidate):
-    """Read a recruiter's privately stored resume."""
+    """
+    Read a recruiter's privately stored resume.
 
-    upload_folder = Path(
-        current_app.config["RESUME_UPLOAD_FOLDER"]
-    ).resolve()
+    Supports new TiDB database storage and legacy
+    local-file storage.
+    """
 
-    if not candidate.resume_path:
-        raise FileNotFoundError(
-            "Candidate resume path is missing."
+    # New database-backed storage (TiDB)
+    if candidate.resume_file and candidate.resume_file.file_data:
+
+        return get_full_resume_text_from_bytes(
+            candidate.resume_file.file_data,
+            candidate.resume_file.original_filename
         )
 
-    resume_path = (
-        upload_folder / Path(candidate.resume_path).name
-    ).resolve()
+    # Legacy local-file storage fallback
+    if candidate.resume_path:
 
-    if resume_path.parent != upload_folder:
-        raise ValueError(
-            "Invalid resume file path."
-        )
+        upload_folder = Path(
+            current_app.config["RESUME_UPLOAD_FOLDER"]
+        ).resolve()
 
-    if not resume_path.is_file():
-        raise FileNotFoundError(
-            "Candidate resume was not found."
-        )
+        resume_path = (
+            upload_folder / Path(candidate.resume_path).name
+        ).resolve()
 
-    return get_full_resume_text(resume_path)
+        if resume_path.parent != upload_folder:
+            raise ValueError(
+                "Invalid resume file path."
+            )
+
+        if not resume_path.is_file():
+            raise FileNotFoundError(
+                "Candidate resume was not found."
+            )
+
+        return get_full_resume_text(resume_path)
+
+    raise FileNotFoundError(
+        "Candidate resume is missing from database storage."
+    )
 
 
 # =========================================================

@@ -4,10 +4,11 @@ Secure one-time candidate document upload routes for HireWise AI.
 
 Candidates receive a secure link after selection and submit
 all applicable documents in one submission.
+
+Uploaded documents are stored privately in TiDB.
 """
 
 import hashlib
-import secrets
 from datetime import datetime
 from pathlib import Path
 
@@ -18,7 +19,6 @@ from flask import (
     flash,
     render_template,
     request,
-    url_for,
 )
 
 from sqlalchemy import select
@@ -35,6 +35,8 @@ from models import (
     AuditLog,
 )
 
+from services.file_service import create_stored_file
+
 
 document_upload_bp = Blueprint(
     "document_upload",
@@ -43,9 +45,9 @@ document_upload_bp = Blueprint(
 )
 
 
-# --------------------------------------------------
-# DOCUMENT CONFIGURATION
-# --------------------------------------------------
+# =========================================================
+# 1. DOCUMENT CONFIGURATION
+# =========================================================
 
 MAX_FILE_SIZE = 5 * 1024 * 1024
 
@@ -157,9 +159,17 @@ IDENTITY_ALTERNATIVES = (
 )
 
 
-# --------------------------------------------------
-# TOKEN HELPERS
-# --------------------------------------------------
+MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+}
+
+
+# =========================================================
+# 2. TOKEN HELPERS
+# =========================================================
 
 def hash_upload_token(token):
     """Return a SHA-256 hash of the original upload token."""
@@ -211,15 +221,25 @@ def get_valid_upload_link(token):
     if (candidate.status or "").lower() != "selected":
         abort(403)
 
-    if candidate.document_submission is not None:
+    # Check the database directly instead of relying only
+    # on a potentially cached SQLAlchemy relationship.
+    existing_submission_id = db.session.scalar(
+        select(DocumentSubmission.id)
+        .where(
+            DocumentSubmission.candidate_id == candidate.id
+        )
+        .limit(1)
+    )
+
+    if existing_submission_id is not None:
         abort(410)
 
     return upload_link, candidate
 
 
-# --------------------------------------------------
-# FILE VALIDATION
-# --------------------------------------------------
+# =========================================================
+# 3. FILE VALIDATION
+# =========================================================
 
 def validate_file_signature(file, extension):
     """
@@ -256,7 +276,7 @@ def validate_file_signature(file, extension):
 
 
 def validate_document(file):
-    """Validate the uploaded filename, extension, size and signature."""
+    """Validate filename, extension, size and file signature."""
 
     if not file or not file.filename:
         raise ValueError("Please select a document.")
@@ -272,6 +292,11 @@ def validate_document(file):
         raise ValueError(
             "Only PDF, JPG, JPEG and PNG files are allowed."
         )
+
+    # Keep the filename within the database column limit.
+    suffix = extension
+    stem = Path(filename).stem
+    filename = stem[:255 - len(suffix)] + suffix
 
     file.stream.seek(0, 2)
 
@@ -292,38 +317,9 @@ def validate_document(file):
     return filename, extension, file_size
 
 
-# --------------------------------------------------
-# PRIVATE STORAGE
-# --------------------------------------------------
-
-def get_private_document_folder(candidate_id):
-    """Return a private folder outside the public static directory."""
-
-    configured_folder = current_app.config.get(
-        "PRIVATE_DOCUMENT_FOLDER"
-    )
-
-    if configured_folder:
-        base_folder = Path(configured_folder)
-    else:
-        base_folder = (
-            Path(current_app.instance_path)
-            / "private_documents"
-        )
-
-    candidate_folder = base_folder / str(candidate_id)
-
-    candidate_folder.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    return candidate_folder
-
-
-# --------------------------------------------------
-# PUBLIC ONE-TIME UPLOAD PORTAL
-# --------------------------------------------------
+# =========================================================
+# 4. PUBLIC ONE-TIME UPLOAD PORTAL
+# =========================================================
 
 @document_upload_bp.route(
     "/submit/<token>",
@@ -333,8 +329,9 @@ def submit_documents(token):
     """
     Allow a selected candidate to submit documents once.
 
-    A successful submission consumes the upload link and
-    creates one unique DocumentSubmission record.
+    All uploaded file binaries, document records,
+    submission metadata and audit records are committed
+    in one database transaction.
     """
 
     upload_link, candidate = get_valid_upload_link(token)
@@ -348,9 +345,9 @@ def submit_documents(token):
             document_fields=DOCUMENT_FIELDS,
         )
 
-    # ----------------------------------------------
+    # -----------------------------------------------------
     # CHECK IDENTITY ALTERNATIVE
-    # ----------------------------------------------
+    # -----------------------------------------------------
 
     has_identity_alternative = any(
         request.files.get(field)
@@ -373,9 +370,9 @@ def submit_documents(token):
             document_fields=DOCUMENT_FIELDS,
         ), 400
 
-    # ----------------------------------------------
+    # -----------------------------------------------------
     # VALIDATE ALL DOCUMENTS
-    # ----------------------------------------------
+    # -----------------------------------------------------
 
     prepared_documents = []
 
@@ -398,16 +395,14 @@ def submit_documents(token):
                 uploaded_file
             )
 
-            prepared_documents.append(
-                {
-                    "file": uploaded_file,
-                    "filename": filename,
-                    "extension": extension,
-                    "file_size": file_size,
-                    "category": settings["category"],
-                    "document_type": settings["document_type"],
-                }
-            )
+            prepared_documents.append({
+                "file": uploaded_file,
+                "filename": filename,
+                "extension": extension,
+                "file_size": file_size,
+                "category": settings["category"],
+                "document_type": settings["document_type"],
+            })
 
     except ValueError as error:
 
@@ -434,19 +429,22 @@ def submit_documents(token):
             document_fields=DOCUMENT_FIELDS,
         ), 400
 
-    # ----------------------------------------------
+    # -----------------------------------------------------
     # SAVE FILES AND DATABASE RECORDS
-    # ----------------------------------------------
-
-    saved_paths = []
+    # -----------------------------------------------------
 
     try:
 
-        # Lock the upload link row where supported by the DB.
+        # Lock and refresh the upload link row.
+        # populate_existing ensures the ORM refreshes previously
+        # loaded values after the database lock is acquired.
         locked_link = db.session.scalar(
             select(DocumentUploadLink)
-            .where(DocumentUploadLink.id == upload_link.id)
+            .where(
+                DocumentUploadLink.id == upload_link.id
+            )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
 
         if locked_link is None:
@@ -454,48 +452,72 @@ def submit_documents(token):
 
         now = datetime.utcnow()
 
+        # Recheck candidate status using a fresh database query.
+        current_candidate_status = db.session.scalar(
+            select(Candidate.status).where(
+                Candidate.id == candidate.id
+            )
+        )
+
+        # Recheck existing submission directly in the database.
+        existing_submission_id = db.session.scalar(
+            select(DocumentSubmission.id)
+            .where(
+                DocumentSubmission.candidate_id == candidate.id
+            )
+            .limit(1)
+        )
+
+        # Recheck all one-time submission conditions.
         if (
             locked_link.used_at is not None
             or locked_link.revoked_at is not None
             or locked_link.expires_at is None
             or locked_link.expires_at <= now
-            or candidate.document_submission is not None
+            or existing_submission_id is not None
+            or (current_candidate_status or "").lower() != "selected"
         ):
             abort(410)
 
-        private_folder = get_private_document_folder(
-            candidate.id
-        )
-
         document_records = []
+
+        # -------------------------------------------------
+        # STORE DOCUMENT BINARIES IN TIDB
+        # -------------------------------------------------
 
         for item in prepared_documents:
 
-            stored_filename = (
-                secrets.token_hex(16)
-                + item["extension"]
+            # Create the database-backed file record.
+            stored_file = create_stored_file(
+                item["file"],
+                original_filename=item["filename"],
+                mime_type=MIME_TYPES[item["extension"]],
             )
 
-            file_path = private_folder / stored_filename
+            db.session.add(stored_file)
 
-            item["file"].save(str(file_path))
+            # Generate the StoredFile ID.
+            db.session.flush()
 
-            saved_paths.append(file_path)
-
+            # Create candidate document metadata.
             document = CandidateDocument(
                 candidate_id=candidate.id,
                 category=item["category"],
                 document_type=item["document_type"],
                 original_filename=item["filename"],
-                file_path=str(file_path),
-                mime_type=item["file"].mimetype,
-                file_size=item["file_size"],
+                file_path=None,
+                stored_file_id=stored_file.id,
+                mime_type=stored_file.mime_type,
+                file_size=stored_file.file_size,
                 verification_status="Pending Verification",
             )
 
             document_records.append(document)
 
-        # Create the one-time submission.
+        # -------------------------------------------------
+        # CREATE ONE-TIME DOCUMENT SUBMISSION
+        # -------------------------------------------------
+
         submission = DocumentSubmission(
             candidate_id=candidate.id,
             status="Submitted",
@@ -504,16 +526,19 @@ def submit_documents(token):
 
         db.session.add(submission)
 
-        # Generate submission ID before creating audit record.
+        # Generate the submission ID before creating the audit.
         db.session.flush()
 
         # Consume the upload link.
         locked_link.used_at = now
 
-        # Store all uploaded documents.
+        # Add all document records.
         db.session.add_all(document_records)
 
-        # Create audit record.
+        # -------------------------------------------------
+        # CREATE AUDIT RECORD
+        # -------------------------------------------------
+
         audit = AuditLog(
             user_id=None,
             action="Candidate documents submitted",
@@ -522,26 +547,23 @@ def submit_documents(token):
             details_json={
                 "submission_id": submission.id,
                 "document_count": len(document_records),
+                "storage_location": "TiDB",
             },
         )
 
         db.session.add(audit)
 
-        # Commit everything together.
+        # -------------------------------------------------
+        # COMMIT EVERYTHING TOGETHER
+        # -------------------------------------------------
+
         db.session.commit()
 
     except IntegrityError:
 
+        # Roll back the document binaries, metadata,
+        # submission and consumed-link change together.
         db.session.rollback()
-
-        for file_path in saved_paths:
-            try:
-                if file_path.exists():
-                    file_path.unlink()
-            except OSError:
-                current_app.logger.exception(
-                    "Could not clean up an incomplete upload."
-                )
 
         flash(
             "A document submission has already been completed. "
@@ -560,20 +582,16 @@ def submit_documents(token):
 
         db.session.rollback()
 
-        for file_path in saved_paths:
-            try:
-                if file_path.exists():
-                    file_path.unlink()
-            except OSError:
-                current_app.logger.exception(
-                    "Could not remove an incomplete document upload."
-                )
+        current_app.logger.exception(
+            "Candidate document submission failed for candidate ID %s.",
+            candidate.id,
+        )
 
         raise
 
-    # ----------------------------------------------
+    # -----------------------------------------------------
     # SUCCESS PAGE
-    # ----------------------------------------------
+    # -----------------------------------------------------
 
     return render_template(
         "candidate/document_upload_success.html",

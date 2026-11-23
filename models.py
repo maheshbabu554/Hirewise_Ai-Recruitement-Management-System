@@ -10,6 +10,7 @@ from datetime import datetime
 
 from flask_login import UserMixin
 from sqlalchemy import UniqueConstraint
+from sqlalchemy.dialects.mysql import MEDIUMBLOB
 
 from extensions import db
 
@@ -70,6 +71,7 @@ class User(UserMixin, db.Model):
         "AuditLog",
         back_populates="user"
     )
+
     login_otps = db.relationship(
         "LoginOTP",
         back_populates="user",
@@ -170,7 +172,15 @@ class Candidate(db.Model):
 
     phone = db.Column(db.String(20))
 
+    # Retained for compatibility with older local resume files.
     resume_path = db.Column(db.String(255))
+
+    # Database-backed resume reference.
+    resume_file_id = db.Column(
+        db.Integer,
+        db.ForeignKey("stored_files.id"),
+        nullable=True
+    )
 
     extracted_profile_json = db.Column(db.JSON)
 
@@ -263,6 +273,12 @@ class Candidate(db.Model):
     email_logs = db.relationship(
         "EmailLog",
         back_populates="candidate"
+    )
+
+    # Database-backed resume relationship.
+    resume_file = db.relationship(
+        "StoredFile",
+        foreign_keys=[resume_file_id]
     )
 
 
@@ -759,9 +775,17 @@ class CandidateDocument(db.Model):
         nullable=False
     )
 
+    # Retained for compatibility with older local documents.
     file_path = db.Column(
         db.String(500),
-        nullable=False
+        nullable=True
+    )
+
+    # Database-backed document reference.
+    stored_file_id = db.Column(
+        db.Integer,
+        db.ForeignKey("stored_files.id"),
+        nullable=True
     )
 
     mime_type = db.Column(db.String(100))
@@ -798,6 +822,11 @@ class CandidateDocument(db.Model):
     verified_by = db.relationship(
         "User",
         foreign_keys=[verified_by_id]
+    )
+
+    stored_file = db.relationship(
+        "StoredFile",
+        foreign_keys=[stored_file_id]
     )
 
 
@@ -871,6 +900,8 @@ class EmailLog(db.Model):
         "Interview",
         back_populates="email_logs"
     )
+
+
 # =========================================================
 # 15. LOGIN OTP MODEL
 # =========================================================
@@ -921,4 +952,46 @@ class LoginOTP(db.Model):
     user = db.relationship(
         "User",
         back_populates="login_otps"
+    )
+
+
+# =========================================================
+# 16. STORED FILE MODEL
+# =========================================================
+
+class StoredFile(db.Model):
+    """Store private uploaded files directly in the database."""
+
+    __tablename__ = "stored_files"
+
+    id = db.Column(
+        db.Integer,
+        primary_key=True
+    )
+
+    # MEDIUMBLOB supports files larger than the regular MySQL BLOB.
+    file_data = db.Column(
+        MEDIUMBLOB,
+        nullable=False
+    )
+
+    original_filename = db.Column(
+        db.String(255),
+        nullable=False
+    )
+
+    mime_type = db.Column(
+        db.String(100),
+        nullable=False
+    )
+
+    file_size = db.Column(
+        db.Integer,
+        nullable=False
+    )
+
+    created_at = db.Column(
+        db.DateTime,
+        default=datetime.utcnow,
+        nullable=False
     )

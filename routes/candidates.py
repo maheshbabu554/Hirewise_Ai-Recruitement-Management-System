@@ -25,6 +25,7 @@ import uuid
 
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from io import BytesIO
 from pathlib import Path
 
 from flask import (
@@ -64,13 +65,15 @@ from models import (
 from routes.recruiter import recruiter_required
 
 from services.file_service import (
-    save_resume,
-    delete_resume,
+    create_stored_file,
     validate_resume,
     validate_batch_count,
 )
 
-from services.resume_parser import get_full_resume_text
+from services.resume_parser import (
+    get_full_resume_text,
+    get_full_resume_text_from_bytes,
+)
 
 from services.ai_service import (
     AIServiceError,
@@ -232,20 +235,34 @@ def automatically_extract_candidate(candidate):
     recruiter-confirmed profile.
     """
 
-    upload_folder = Path(
-        current_app.config["RESUME_UPLOAD_FOLDER"]
-    ).resolve()
+    # New resumes are stored as binary data in TiDB.
+    stored_resume = candidate.resume_file
 
-    filename = Path(candidate.resume_path).name
-    resume_path = (upload_folder / filename).resolve()
+    if stored_resume is not None:
+        resume_text = get_full_resume_text_from_bytes(
+            stored_resume.file_data,
+            stored_resume.original_filename,
+        )
 
-    if resume_path.parent != upload_folder:
-        raise ValueError("Invalid resume file path.")
+    # Keep support for candidates uploaded before database-backed storage.
+    elif candidate.resume_path:
+        upload_folder = Path(
+            current_app.config["RESUME_UPLOAD_FOLDER"]
+        ).resolve()
 
-    if not resume_path.is_file():
+        filename = Path(candidate.resume_path).name
+        resume_path = (upload_folder / filename).resolve()
+
+        if resume_path.parent != upload_folder:
+            raise ValueError("Invalid resume file path.")
+
+        if not resume_path.is_file():
+            raise FileNotFoundError("Uploaded resume was not found.")
+
+        resume_text = get_full_resume_text(resume_path)
+
+    else:
         raise FileNotFoundError("Uploaded resume was not found.")
-
-    resume_text = get_full_resume_text(resume_path)
 
     if not resume_text.strip():
         raise ValueError("No readable text found in the resume.")
@@ -279,7 +296,7 @@ def automatically_extract_candidate(candidate):
     extracted_name = profile.get("full_name")
 
     if isinstance(extracted_name, str) and extracted_name.strip():
-        candidate.full_name = extracted_name.strip()[:150]
+        candidate.full_name = extracted_name.strip()[:120]
 
     # AI-extracted contact details are not recruiter-confirmed.
     candidate.email = None
@@ -367,7 +384,7 @@ def upload_resumes():
 
             prepared_files.append({
                 "file": file,
-                "temporary_name": temporary_name[:150],
+                "temporary_name": temporary_name[:120],
                 "original_name": original_name,
             })
 
@@ -389,20 +406,31 @@ def upload_resumes():
             )
         )
 
-    saved_files = []
     uploaded_candidate_ids = []
 
     try:
         for item in prepared_files:
-            saved_file = save_resume(item["file"])
-            saved_files.append(saved_file["relative_path"])
+            # Build a StoredFile ORM record. The bytes and candidate
+            # reference are committed together in the same transaction.
+            stored_file = create_stored_file(
+                item["file"],
+                original_filename=item["original_name"],
+                mime_type=(
+                    item["file"].mimetype
+                    or "application/octet-stream"
+                ),
+            )
+
+            db.session.add(stored_file)
+            db.session.flush()
 
             candidate = Candidate(
                 vacancy_id=vacancy.id,
                 full_name=item["temporary_name"],
                 email=None,
                 phone=None,
-                resume_path=saved_file["relative_path"],
+                resume_path=None,
+                resume_file_id=stored_file.id,
                 extracted_profile_json=None,
                 confirmed_profile_json=None,
                 status="New",
@@ -416,15 +444,9 @@ def upload_resumes():
         db.session.commit()
 
     except Exception:
+        # Rolling back removes both the candidate rows and their
+        # database-stored resume files from this upload transaction.
         db.session.rollback()
-
-        for file_path in saved_files:
-            try:
-                delete_resume(file_path)
-            except OSError:
-                current_app.logger.exception(
-                    "Unable to delete resume after upload failure."
-                )
 
         current_app.logger.exception("Resume upload failed.")
 
@@ -737,6 +759,32 @@ def download_resume(candidate_id):
 
     candidate = get_recruiter_candidate(candidate_id)
 
+    # Prefer the database-backed resume for newly uploaded candidates.
+    stored_resume = candidate.resume_file
+
+    if stored_resume is not None:
+        if not stored_resume.file_data:
+            abort(404)
+
+        download_name = secure_filename(
+            stored_resume.original_filename or ""
+        ) or "resume"
+
+        response = send_file(
+            BytesIO(stored_resume.file_data),
+            mimetype=(
+                stored_resume.mime_type
+                or "application/octet-stream"
+            ),
+            as_attachment=True,
+            download_name=download_name,
+        )
+
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+
+    # Legacy filesystem fallback for resumes uploaded before this migration.
     if not candidate.resume_path:
         abort(404)
 
@@ -750,21 +798,38 @@ def download_resume(candidate_id):
     if resume_path.parent != upload_folder or not resume_path.is_file():
         abort(404)
 
-    return send_file(
+    response = send_file(
         resume_path,
         as_attachment=True,
         download_name=filename,
     )
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 # =========================================================
 # PRIVATE CANDIDATE DOCUMENT PATH VALIDATION
 # =========================================================
 
-def get_candidate_document_path(candidate, document):
-    """Validate and return a file path inside the candidate's folder."""
+def get_candidate_document_source(candidate, document):
+    """Return a database stream or validated legacy document path."""
 
-    if document is None or not document.file_path:
+    if document is None:
+        abort(404)
+
+    # New candidate documents are stored directly in TiDB.
+    stored_file = document.stored_file
+
+    if stored_file is not None:
+        if not stored_file.file_data:
+            abort(404)
+        return BytesIO(stored_file.file_data)
+
+    # Legacy filesystem fallback for documents uploaded before the
+    # database-backed document upload route is enabled.
+    if not document.file_path:
         abort(404)
 
     configured_folder = current_app.config.get(
@@ -820,14 +885,14 @@ def download_candidate_document(candidate_id, document_id):
         )
     )
 
-    document_path = get_candidate_document_path(candidate, document)
+    document_source = get_candidate_document_source(candidate, document)
 
     download_name = secure_filename(
         document.original_filename or ""
     ) or "candidate_document"
 
     response = send_file(
-        document_path,
+        document_source,
         mimetype="application/octet-stream",
         as_attachment=True,
         download_name=download_name,
@@ -860,7 +925,7 @@ def view_candidate_document(candidate_id, document_id):
         )
     )
 
-    document_path = get_candidate_document_path(candidate, document)
+    document_source = get_candidate_document_source(candidate, document)
 
     allowed_types = {
         "application/pdf",
@@ -868,7 +933,11 @@ def view_candidate_document(candidate_id, document_id):
         "image/png",
     }
 
-    mime_type = (document.mime_type or "").lower()
+    mime_type = (
+        document.mime_type
+        or (document.stored_file.mime_type if document.stored_file else "")
+        or ""
+    ).lower()
 
     if mime_type not in allowed_types:
         abort(415)
@@ -878,7 +947,7 @@ def view_candidate_document(candidate_id, document_id):
     ) or "candidate_document"
 
     response = send_file(
-        document_path,
+        document_source,
         mimetype=mime_type,
         as_attachment=False,
         download_name=download_name,
@@ -1422,9 +1491,16 @@ def update_candidate_profile(candidate_id):
         )
         return candidate_detail_redirect(candidate.id)
 
-    if len(full_name) > 150 or len(email) > 120:
+    if len(full_name) > 120 or len(email) > 120:
         flash(
-            "Candidate name or email is too long.",
+            "Candidate name and email must not exceed 120 characters.",
+            "danger",
+        )
+        return candidate_detail_redirect(candidate.id)
+
+    if len(phone) > 20:
+        flash(
+            "Phone number cannot exceed 20 characters.",
             "danger",
         )
         return candidate_detail_redirect(candidate.id)
