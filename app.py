@@ -9,8 +9,6 @@ extensions, configures authentication, and registers routes.
 import os
 from pathlib import Path
 
-
-
 from flask import Flask, redirect, url_for, request, g
 
 from config import Config
@@ -38,7 +36,7 @@ def create_app():
     # CATALYST SDK INITIALIZATION
     # -----------------------------------------------------
 
-    
+
     # -----------------------------------------------------
     # INITIALIZE FLASK EXTENSIONS
     # -----------------------------------------------------
